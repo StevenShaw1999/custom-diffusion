@@ -230,11 +230,12 @@ import json
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.utils.data import Dataset
+import math
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel, ControlNetModel, StableDiffusionControlNetPipeline
 from diffusers.models.attention import CrossAttention
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
@@ -243,9 +244,24 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 from transformers import CLIPTextModel, CLIPTokenizer
+from annotator.hed import HEDdetector
+import torchvision
+from diffusers.loaders import AttnProcsLayers
+from diffusers.models.cross_attention import LoRACrossAttnProcessor
+
 
 from src import retrieve
 from geomloss import SamplesLoss
+
+from attention_control import *
+
+from lora_diffusion import (
+    extract_lora_ups_down,
+    inject_trainable_lora,
+    safetensors_available,
+    save_lora_weight,
+    save_safeloras,
+)
 
 logger = get_logger(__name__)
 
@@ -290,22 +306,17 @@ def create_custom_diffusion(unet, freeze_model):
 
         dim = query.shape[-1]
 
-        query = self.reshape_heads_to_batch_dim(query)
-        key = self.reshape_heads_to_batch_dim(key)
-        value = self.reshape_heads_to_batch_dim(value)
+        query = self.head_to_batch_dim(query)
+        key = self.head_to_batch_dim(key)
+        value = self.head_to_batch_dim(value)
 
         # TODO(PVP) - mask is currently never used. Remember to re-implement when used
 
         # attention, what we cannot get enough of
-        if self._use_memory_efficient_attention_xformers:
-            hidden_states = self._memory_efficient_attention_xformers(query, key, value)
-            # Some versions of xformers return output in fp32, cast it back to the dtype of the input
-            hidden_states = hidden_states.to(query.dtype)
-        else:
-            if self._slice_size is None or query.shape[0] // self._slice_size == 1:
-                hidden_states = self._attention(query, key, value)
-            else:
-                hidden_states = self._sliced_attention(query, key, value, sequence_length, dim)
+
+        attention_probs = self.get_attention_scores(query, key)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = self.batch_to_head_dim(hidden_states)
 
         # linear proj
         hidden_states = self.to_out[0](hidden_states)
@@ -320,32 +331,31 @@ def create_custom_diffusion(unet, freeze_model):
                 setattr(layer, 'forward', bound_method)
             else:
                 change_forward(layer)
-
     change_forward(unet)
     return unet
 
 
 def save_progress(text_encoder, unet, modifier_token_id, accelerator, args, save_path):
     logger.info("Saving embeddings")
-    delta_dict = {'unet': {}, 'modifier_token': {}}
+    delta_dict = {'modifier_token': {}}
     if args.modifier_token is not None:
         for i in range(len(modifier_token_id)):
             learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[modifier_token_id[i]]
             delta_dict['modifier_token'][args.modifier_token[i]] = learned_embeds.detach().cpu()
     elif args.train_text_encoder:
         delta_dict['text_encoder'] = accelerator.unwrap_model(text_encoder).state_dict()
-    for name, params in accelerator.unwrap_model(unet).named_parameters():
+    """for name, params in accelerator.unwrap_model(unet).named_parameters():
         if args.freeze_model == 'crossattn':
             if 'attn2' in name:
                 delta_dict['unet'][name] = params.cpu().clone()
         else:
             if 'attn2.to_k' in name or 'attn2.to_v' in name:
-                delta_dict['unet'][name] = params.cpu().clone()
+                delta_dict['unet'][name] = params.cpu().clone()"""
 
     torch.save(delta_dict, save_path)
 
 
-def load_model(text_encoder, tokenizer, unet, save_path, compress=False, freeze_model='crossattn_kv'):
+def load_model(text_encoder, tokenizer, unet, save_path, compress, freeze_model='crossattn_kv'):
     st = torch.load(save_path)
     if 'text_encoder' in st:
         text_encoder.load_state_dict(st['text_encoder'])
@@ -377,28 +387,6 @@ def load_model(text_encoder, tokenizer, unet, save_path, compress=False, freeze_
                     params.data += st['unet'][name]['u']@st['unet'][name]['v']
                 else:
                     params.data.copy_(st['unet'][f'{name}'])
-
-
-def load_model_new(text_encoder, tokenizer, save_path):
-    st = torch.load(save_path)
-    if 'text_encoder' in st:
-        text_encoder.load_state_dict(st['text_encoder'])
-    if 'modifier_token' in st:
-        modifier_tokens = list(st['modifier_token'].keys())
-        print(modifier_tokens)
-        modifier_token_id = []
-        for modifier_token in modifier_tokens:
-            _ = tokenizer.add_tokens(modifier_token)
-            modifier_token_id.append(tokenizer.convert_tokens_to_ids(modifier_token))
-
-        # Resize the token embeddings as we are adding new special tokens to the tokenizer
-        text_encoder.resize_token_embeddings(len(tokenizer))
-        token_embeds = text_encoder.get_input_embeddings().weight.data
-        for i, id_ in enumerate(modifier_token_id):
-            token_embeds[id_] = st['modifier_token'][modifier_tokens[i]]
-
-    print(st.keys())
-
 
 
 def freeze_params(params):
@@ -434,6 +422,18 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=4,
+        help="Rank of LoRA approximation.",
+    )
+    parser.add_argument(
+        "--resume_unet",
+        type=str,
+        default=None,
+        help=("File path for unet lora to resume training."),
     )
     parser.add_argument(
         "--revision",
@@ -648,6 +648,8 @@ def parse_args(input_args=None):
     return args
 
 
+
+
 class CustomDiffusionDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
@@ -815,7 +817,7 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
-
+    torch.autograd.set_detect_anomaly(True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -914,8 +916,7 @@ def main(args):
                     gitignore.write("epoch_*\n")
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
-    print('Here')
-    print(args.tokenizer_name)
+
     # Load the tokenizer
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -952,6 +953,31 @@ def main(args):
         subfolder="unet",
         revision=args.revision,
     )
+    controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-hed", revision=args.revision)
+    apply_hed = HEDdetector()
+    controlnet.requires_grad_(False)
+    unet.requires_grad_(False)
+    
+    lora_attn_procs = {}
+    for name in unet.attn_processors.keys():
+        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks.")])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks.")])
+            hidden_size = unet.config.block_out_channels[block_id]
+
+        lora_attn_procs[name] = LoRACrossAttnProcessor(
+            hidden_size=hidden_size, cross_attention_dim=cross_attention_dim
+        )
+
+    unet.set_attn_processor(lora_attn_procs)
+    lora_layers = AttnProcsLayers(unet.attn_processors)
+
+    accelerator.register_for_checkpointing(lora_layers)
 
     vae.requires_grad_(False)
     if not args.train_text_encoder:
@@ -983,6 +1009,10 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     unet = create_custom_diffusion(unet, args.freeze_model)
+
+    #controller = AttentionStore()
+
+    #register_attention_control(unet, controller)
     
     # Adding a modifier token which is optimized ####
     # Code taken from https://github.com/huggingface/diffusers/blob/main/examples/textual_inversion/textual_inversion.py
@@ -1004,7 +1034,6 @@ def main(args):
 
             # Convert the initializer_token, placeholder_token to ids
             token_ids = tokenizer.encode([initializer_token], add_special_tokens=False)
-            print(token_ids)
             # Check if initializer_token is a single token or a sequence of tokens
             if len(token_ids) > 1:
                 raise ValueError("The initializer token must be a single token.")
@@ -1017,9 +1046,9 @@ def main(args):
 
         # Initialise the newly added placeholder token with the embeddings of the initializer token
         token_embeds = text_encoder.get_input_embeddings().weight.data
-        for (x,y) in zip(modifier_token_id,initializer_token_id):
-            token_embeds[x] = token_embeds[y]
 
+        for (x,y) in zip(modifier_token_id,initializer_token_id):        
+            token_embeds[x] = token_embeds[2368]
         # Freeze all parameters except for the token embeddings in text encoder
         params_to_freeze = itertools.chain(
             text_encoder.text_model.encoder.parameters(),
@@ -1027,23 +1056,22 @@ def main(args):
             text_encoder.text_model.embeddings.position_embedding.parameters(),
         )
         freeze_params(params_to_freeze)
+        #params_to_optimize = itertools.chain( text_encoder.get_input_embeddings().parameters())
+        #hh = list(text_encoder.get_input_embeddings().parameters())
+        
+        params_to_optimize = itertools.chain([
+            {"params": itertools.chain(lora_layers.parameters()), "lr": args.learning_rate},
+            {"params": itertools.chain(text_encoder.get_input_embeddings().parameters()), "lr": args.learning_rate * 5},
+        ])
 
-        if args.freeze_model == 'crossattn':
-            params_to_optimize = itertools.chain( text_encoder.get_input_embeddings().parameters() , [x[1] for x in unet.named_parameters() if 'attn2' in x[0]] )
-        else:
-            params_to_optimize = itertools.chain( text_encoder.get_input_embeddings().parameters() , [x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])] )
+        #params_to_optimize = itertools.chain(text_encoder.get_input_embeddings().parameters() , [x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])] )
 
     ########################################################
     ########################################################
     else:
-        if args.freeze_model == 'crossattn':
-            params_to_optimize = (
-                itertools.chain([x[1] for x in unet.named_parameters() if 'attn2' in x[0]], text_encoder.parameters() if args.train_text_encoder else [] ) 
-            )
-        else:
-            params_to_optimize = (
-                itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])], text_encoder.parameters() if args.train_text_encoder else [] ) 
-            )
+        params_to_optimize = (
+            itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])], text_encoder.parameters() if args.train_text_encoder else [] ) 
+        )
 
     optimizer = optimizer_class(
         params_to_optimize,
@@ -1114,12 +1142,19 @@ def main(args):
     )
 
     if args.train_text_encoder or args.modifier_token is not None:
-        unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+        """unet, text_encoder, optimizer, train_dataloader, lr_scheduler, controlnet = accelerator.prepare(
+            unet, text_encoder, optimizer, train_dataloader, lr_scheduler, controlnet
+        )"""
+        unet, text_encoder, controlnet, apply_hed, lora_layers = accelerator.prepare(
+            unet, text_encoder, controlnet, apply_hed, lora_layers
+        )
+
+        optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            optimizer, train_dataloader, lr_scheduler
         )
     else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
+        unet, optimizer, train_dataloader, lr_scheduler, controlnet = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler, controlnet
         )
 
     weight_dtype = torch.float32
@@ -1163,7 +1198,8 @@ def main(args):
     progress_bar.set_description("Steps")
     global_step = 0
 
-    loss_func = SamplesLoss(loss="sinkhorn", p=2, blur=.05)
+    #loss_func = SamplesLoss(loss="sinkhorn", p=2, blur=.05)
+    #ones_mask = torch.ones(4, 1, 64, 64).to(accelerator.device)
 
     for epoch in range(args.num_train_epochs):
         unet.train()
@@ -1172,7 +1208,7 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                
+
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * 0.18215
 
@@ -1184,6 +1220,10 @@ def main(args):
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
+                #timesteps_exp = torch.exp(-timesteps / 1500).reshape(4, 1, 1, 1)
+
+                
+
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
 
@@ -1192,13 +1232,80 @@ def main(args):
 
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                new_batch_prompts = batch["input_ids"]
+
+
+                #prior_prompts = batch["input_ids"][-1].unsqueeze(0).repeat(4, 1)
+
+                
+                # change the condition of prior loss to [<new1> cat]
+
+                #new_batch_prompts_clone = new_batch_prompts.clone()[2:, 2:-1]
+                
+                #print(new_batch_prompts)
+                
+                #print(new_batch_prompts[-1])
+
+                #wher_instance = torch.where(new_batch_prompts == 786)[1]
+
+                mask_instance = torch.zeros((4, 1, 64, 64)).to(latents.device)
+                mask_instance[:2] = mask_instance[:2].masked_fill(torch.rand((2, 1, 64, 64)).to(latents.device) > 0.2, 1)
+                mask_instance[2:] = mask_instance[2:].masked_fill(torch.rand((2, 1, 64, 64)).to(latents.device) > 0.7, 1)
+
+                #ones_mask[2:] = mask
+                
+                encoder_hidden_states = text_encoder(new_batch_prompts)[0]
+
 
                 # Predict the noise residual
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
+                """if step == 3:
+                    image = out.cpu()
+                    image = 255 * image[1].squeeze()
+                    image = image.unsqueeze(-1).expand(*image.shape, 3)
+                    image = image.numpy().astype(np.uint8)
+                    image = np.array(Image.fromarray(image))
+                    pil_img = Image.fromarray(image)
+                    pil_img.save(f'test_output/test_attn.png')
+                    exit()"""
 
+                
+                
+                rnd = torch.rand(1)
+                #rnd = 1
+                if rnd >= 0.5:
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, mid_block_additional_residual=None, down_block_additional_residuals=None).sample
+                else:
+                    with torch.no_grad():
+                        hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
+                    control_addition = controlnet(noisy_latents, timesteps, encoder_hidden_states, hed).mid_block_res_sample
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, mid_block_additional_residual=control_addition).sample
 
+                """if step >= int(args.num_train_epochs / 3 * 2): 
+                #control_addition = controlnet(noisy_latents, timesteps, encoder_hidden_states, hed).mid_block_res_sample
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, mid_block_additional_residual=None, down_block_additional_residuals=None).sample
+                elif int(args.num_train_epochs / 3) <= step < int(args.num_train_epochs / 3 * 2): 
+                #else:
+                    with torch.no_grad():
+                        hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
+                    control_addition = controlnet(noisy_latents, timesteps, encoder_hidden_states, hed).mid_block_res_sample
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, mid_block_additional_residual=control_addition).sample
+                else:
+                    with torch.no_grad():
+                        hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
+                    down_cond, mid_cond = controlnet(noisy_latents, timesteps, encoder_hidden_states, hed, return_dict=False,)
+                    #mid_cond = control_addition.mid_block_res_sample
+                    #down_cond = control_addition.down_block_res_samples
+                    #down_cond = (item.detach() for item in down_cond)
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, down_block_additional_residuals=down_cond,\
+                                      mid_block_additional_residual=mid_cond).sample"""
+                
+                #print(latents.size())
+                #model_pred = unet(latents[3].unsqueeze(0), 0, encoder_hidden_states[3].unsqueeze(0)).sample
+                #hh = controller.get_average_attention()
+                
+
+                
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -1212,9 +1319,8 @@ def main(args):
                     target, target_prior = torch.chunk(target, 2, dim=0)
                     mask = torch.chunk(batch["mask"], 2, dim=0)[0]
                     # Compute instance loss
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = ((loss*mask).sum([1, 2, 3])/mask.sum([1, 2, 3])).mean()
-
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none") #* out_mask[:2]# * timesteps_exp[:2]
+                    loss = ((loss*mask).sum([1, 2, 3])/mask.sum([1, 2, 3])).mean() #/ out_mask[:2].mean()
                     #loss = 0
                     """for b in range(len(model_pred)):
                         arr = torch.tensor([0, 1, 2, 3]).to(latents.device)
@@ -1230,17 +1336,26 @@ def main(args):
 
                     # Compute prior loss
                     prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    #prior_loss = (prior_loss * ).mean() / out_mask_prior.mean()
+                    #prior_loss = F.mse_loss(model_pred_prior.float() * out_mask_prior, target_prior.float() * out_mask_prior, reduction="mean") / out_mask_prior.mean()
 
-
+                    #prior_loss = 0
                     # Add the prior loss to the instance loss.
                     loss = loss + args.prior_loss_weight * prior_loss
                 else:
                     mask = batch["mask"]
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                     loss = ((loss*mask).sum([1, 2, 3])/mask.sum([1, 2, 3])).mean()
-
+                
                 accelerator.backward(loss)
 
+                #print()
+                """if step % 5 == 0:
+
+                    print(text_encoder.get_input_embeddings().weight[modifier_token_id[0]][:50])
+
+                if step == 10:
+                    exit()"""
                 # Zero out the gradients for all token embeddings except the newly added
                 # embeddings for the concept, as we only want to optimize the concept embeddings
                 if args.modifier_token is not None:
@@ -1251,14 +1366,14 @@ def main(args):
                     # Get the index for tokens that we want to zero the grads for
                     index_grads_to_zero = torch.arange(len(tokenizer)) != modifier_token_id[0]
                     for i in range(len(modifier_token_id[1:])):
-                        index_grads_to_zero = index_grads_to_zero & (torch.arange(len(tokenizer)) != modifier_token_id[i])
+                        index_grads_to_zero = index_grads_to_zero | torch.arange(len(tokenizer)) != modifier_token_id[i]
                     grads_text_encoder.data[index_grads_to_zero, :] = grads_text_encoder.data[index_grads_to_zero, :].fill_(0)
 
                 if accelerator.sync_gradients:
                     params_to_clip = (
-                        itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])], text_encoder.parameters())
+                        itertools.chain(lora_layers.parameters(), text_encoder.parameters())
                         if (args.train_text_encoder or args.modifier_token is not None)
-                        else itertools.chain([x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])]) 
+                        else itertools.chain(lora_layers.parameters()) 
                     )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
@@ -1290,8 +1405,11 @@ def main(args):
 
         accelerator.wait_for_everyone()
 
-    # Create the pipeline using the trained modules and save it.
+    # Create the pipeline using using the trained modules and save it.
     if accelerator.is_main_process:
+        unet = accelerator.unwrap_model(unet).to(torch.float32)
+        unet.save_attn_procs(args.output_dir)
+
         pipeline = DiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             unet=accelerator.unwrap_model(unet),
@@ -1300,6 +1418,7 @@ def main(args):
             revision=args.revision,
         )
         pipeline.save_pretrained(args.output_dir)
+
         save_path = os.path.join(args.output_dir, "delta.bin")
         save_progress(text_encoder, unet, modifier_token_id, accelerator, args, save_path)
 
@@ -1311,4 +1430,3 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-

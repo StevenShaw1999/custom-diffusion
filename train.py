@@ -500,6 +500,7 @@ class ImageLogger(Callback):
         self.save_freq = 250
         self.logger_log_images = {
             pl.loggers.TestTubeLogger: self._testtube,
+            #pl.loggers.NeptuneLogger: self._testtube,
         }
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
@@ -723,6 +724,7 @@ if __name__ == "__main__":
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         # default to ddp
         trainer_config["accelerator"] = "ddp"
+        #trainer_config["accelerator"] = "cuda"
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
         if not ("gpus" in trainer_config):
@@ -799,6 +801,7 @@ if __name__ == "__main__":
             },
             "testtube": {
                 "target": "pytorch_lightning.loggers.TestTubeLogger",
+                #"target": "pytorch_lightning.loggers.NeptuneLogger",
                 "params": {
                     "name": "testtube",
                     "save_dir": logdir,

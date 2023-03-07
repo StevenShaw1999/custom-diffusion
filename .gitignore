@@ -1,0 +1,13 @@
+/annotator/
+/__pycache__/
+/ckpt/
+/data/
+/gen_reg/
+/logs/
+/stable-diffusion/
+/data/
+/assets/
+*.pyc
+/src/lora_diffusion/
+/wandb/
+data.zip
