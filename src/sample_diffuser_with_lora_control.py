@@ -54,9 +54,9 @@ def sample(ckpt, delta_ckpt, from_file, prompt, compress, freeze_model):
     pipe.to('cuda')
     if prompt is not None:
         image_list = []
-        for i in range(1, 4):
-            generator = [torch.Generator(device="cpu").manual_seed(j * i) for j in [5,6,7]]
-            images = pipe(prompt=[prompt for i in range(3)], image=detected_map, num_inference_steps=20, guidance_scale=6., \
+        for i in range(1, 3):
+            generator = [torch.Generator(device="cpu").manual_seed(j * i) for j in [5,6]]
+            images = pipe(prompt=[prompt for i in range(2)], image=detected_map, num_inference_steps=20, guidance_scale=6., \
                           eta=1., controlnet_conditioning_scale=0.0, generator=generator).images
             #images = pipe([prompt]*5, num_inference_steps=200, guidance_scale=6., eta=1.).images
             images = np.hstack([np.array(x) for x in images])

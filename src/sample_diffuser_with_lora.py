@@ -32,7 +32,9 @@ def sample(ckpt, delta_ckpt, from_file, prompt, compress, freeze_model):
         image_list = []
         for i in range(1, 4):
             generator = [torch.Generator(device="cpu").manual_seed(j * i) for j in [5,6,7]]
-            images = pipe([prompt]*3, num_inference_steps=20, guidance_scale=6., eta=1., generator=generator).images
+            images = pipe([prompt]*3, num_inference_steps=20, guidance_scale=6., 
+                          negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * 3,
+                          eta=1., generator=generator).images
             #images = pipe([prompt]*5, num_inference_steps=200, guidance_scale=6., eta=1.).images
             images = np.hstack([np.array(x) for x in images])
             image_list.append(images)
