@@ -10,24 +10,28 @@ sys.path.append('./')
 import torch
 from diffusers import StableDiffusionPipeline
 from src import diffuser_training 
-from PIL import Image
+from diffusers import UniPCMultistepScheduler, DPMSolverMultistepScheduler
 
-def sample(ckpt, delta_ckpt, from_file, prompt, compress, batch_size, freeze_model):
+#from lora_diffusion import monkeypatch_or_replace_lora, tune_lora_scale
+
+
+def sample(ckpt, delta_ckpt, from_file, prompt, compress, freeze_model):
     model_id = ckpt
     pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
-
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    
     outdir = 'outputs/txt2img-samples'
     os.makedirs(outdir, exist_ok=True)
+    print(compress)
+    print(freeze_model)
     if delta_ckpt is not None:
-        diffuser_training.load_model(pipe.text_encoder, pipe.tokenizer, pipe.unet, delta_ckpt, compress, freeze_model)
+        diffuser_training.load_model_new(pipe.text_encoder, pipe.tokenizer, delta_ckpt)
         outdir = os.path.dirname(delta_ckpt)
-
-    all_images = []
+    #pipe.unet.load_attn_procs(outdir)
     if prompt is not None:
-<<<<<<< HEAD
         image_list = []
-        for i in range(2):
-            images = pipe([prompt]*2, num_inference_steps=50, guidance_scale=6., eta=1.).images
+        for i in range(1):
+            images = pipe([prompt]*1, num_inference_steps=20, guidance_scale=6., eta=1.).images
             #images = pipe([prompt]*5, num_inference_steps=200, guidance_scale=6., eta=1.).images
             images = np.hstack([np.array(x) for x in images])
             image_list.append(images)
@@ -38,33 +42,18 @@ def sample(ckpt, delta_ckpt, from_file, prompt, compress, batch_size, freeze_mod
         plt.imshow(image_list)
         plt.axis("off")
         plt.savefig(f'{outdir}/{prompt}.png', bbox_inches='tight')
-=======
-        images = pipe([prompt]*batch_size, num_inference_steps=200, guidance_scale=6., eta=1.).images
-        all_images += images
-        images = np.hstack([np.array(x) for x in images])
-        images = Image.fromarray(images)
-        # takes only first 50 characters of prompt to name the image file
-        name = '-'.join(prompt[:50].split())
-        images.save(f'{outdir}/{name}.png')
->>>>>>> origin/main
     else:
         print(f"reading prompts from {from_file}")
         with open(from_file, "r") as f:
             data = f.read().splitlines()
-            data = [[prompt]*batch_size for prompt in data]
+            data = [5 * [prompt] for prompt in data]
 
         for prompt in data:
             images = pipe(prompt, num_inference_steps=200, guidance_scale=6., eta=1.).images
-            all_images += images
             images = np.hstack([np.array(x) for x in images], 0)
-            images = Image.fromarray(images)
-            # takes only first 50 characters of prompt to name the image file
-            name = '-'.join(prompt[0][:50].split())
-            images.save(f'{outdir}/{name}.png')
-
-    os.makedirs(f'{outdir}/samples', exist_ok=True)
-    for i, im in enumerate(all_images):
-        im.save(f'{outdir}/samples/{i}.jpg')
+            plt.imshow(images)
+            plt.axis("off")
+            plt.savefig(f'{outdir}/{prompt[0]}.png', bbox_inches='tight')
 
 
 def parse_args():
@@ -78,7 +67,6 @@ def parse_args():
     parser.add_argument('--prompt', help='prompt to generate', default=None,
                         type=str)
     parser.add_argument("--compress", action='store_true')
-    parser.add_argument("--batch_size", default=5, type=int)
     parser.add_argument('--freeze_model', help='crossattn or crossattn_kv', default='crossattn_kv',
                         type=str)
     return parser.parse_args()
@@ -86,4 +74,4 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    sample(args.ckpt, args.delta_ckpt, args.from_file, args.prompt, args.compress, args.batch_size, args.freeze_model)
+    sample(args.ckpt, args.delta_ckpt, args.from_file, args.prompt, args.compress, args.freeze_model)

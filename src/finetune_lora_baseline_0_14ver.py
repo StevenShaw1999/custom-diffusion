@@ -1048,7 +1048,7 @@ def main(args):
         token_embeds = text_encoder.get_input_embeddings().weight.data
 
         for (x,y) in zip(modifier_token_id,initializer_token_id):        
-            token_embeds[x] = token_embeds[2368]
+            token_embeds[x] = token_embeds[786]
         # Freeze all parameters except for the token embeddings in text encoder
         params_to_freeze = itertools.chain(
             text_encoder.text_model.encoder.parameters(),
@@ -1248,13 +1248,16 @@ def main(args):
 
                 #wher_instance = torch.where(new_batch_prompts == 786)[1]
 
-                mask_instance = torch.zeros((4, 1, 64, 64)).to(latents.device)
-                mask_instance[:2] = mask_instance[:2].masked_fill(torch.rand((2, 1, 64, 64)).to(latents.device) > 0.2, 1)
-                mask_instance[2:] = mask_instance[2:].masked_fill(torch.rand((2, 1, 64, 64)).to(latents.device) > 0.7, 1)
+                #mask_instance = torch.zeros((latents.shape[0], 1, 8, 8)).to(latents.device)
+                #mask_instance = mask_instance.masked_fill(torch.rand((2, 1, 8, 8)).to(latents.device) > (step / args.max_train_steps * 0.9 + 0.1), 1)
+
+                #mask_instance[2:] = mask_instance[2:].masked_fill(torch.rand((2, 1, 64, 64)).to(latents.device) > 0.7, 1)
 
                 #ones_mask[2:] = mask
+
                 
                 encoder_hidden_states = text_encoder(new_batch_prompts)[0]
+                input_hidden_states_contrl = encoder_hidden_states[1].unsqueeze(0).repeat(encoder_hidden_states.shape[0], 1, 1)
 
 
                 # Predict the noise residual
@@ -1271,15 +1274,20 @@ def main(args):
 
                 
                 
-                rnd = torch.rand(1)
+                rnd = torch.ones(latents.shape[0], 1, 1, 1).to(latents.device)
+                rnd = rnd - 1 * step / args.max_train_steps
+                rnd[1] = 0
                 #rnd = 1
-                if rnd >= 0.5:
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, mid_block_additional_residual=None, down_block_additional_residuals=None).sample
-                else:
-                    with torch.no_grad():
-                        hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
-                    control_addition = controlnet(noisy_latents, timesteps, encoder_hidden_states, hed).mid_block_res_sample
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, mid_block_additional_residual=control_addition).sample
+                #if rnd <= 0.5:
+                #    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, mid_block_additional_residual=None, down_block_additional_residuals=None).sample
+                #else:
+                with torch.no_grad():
+                    hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
+                    control_addition = controlnet(noisy_latents, timesteps, input_hidden_states_contrl, hed).mid_block_res_sample
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, \
+                                    mid_block_additional_residual=control_addition * rnd).sample
+
+                #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
                 """if step >= int(args.num_train_epochs / 3 * 2): 
                 #control_addition = controlnet(noisy_latents, timesteps, encoder_hidden_states, hed).mid_block_res_sample
