@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 sys.path.append('./')
 import torch
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionPipeline, UNet2DConditionModel
 from src import diffuser_training 
 from diffusers import UniPCMultistepScheduler, DPMSolverMultistepScheduler
 
@@ -27,6 +27,7 @@ def sample(ckpt, delta_ckpt, from_file, prompt, compress, freeze_model):
     if delta_ckpt is not None:
         diffuser_training.load_model_new(pipe.text_encoder, pipe.tokenizer, delta_ckpt)
         outdir = os.path.dirname(delta_ckpt)
+    
     pipe.unet.load_attn_procs(outdir)
     if prompt is not None:
         image_list = []
@@ -34,7 +35,8 @@ def sample(ckpt, delta_ckpt, from_file, prompt, compress, freeze_model):
             generator = [torch.Generator(device="cpu").manual_seed(j * i) for j in [5,6,7]]
             images = pipe([prompt]*3, num_inference_steps=20, guidance_scale=6., 
                           negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * 3,
-                          eta=1., generator=generator).images
+                          eta=1., generator=generator,
+                         cross_attention_kwargs={"scale": 1.0}).images
             #images = pipe([prompt]*5, num_inference_steps=200, guidance_scale=6., eta=1.).images
             images = np.hstack([np.array(x) for x in images])
             image_list.append(images)
