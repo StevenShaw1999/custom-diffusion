@@ -1295,9 +1295,14 @@ def main(args):
                 #mixed_prompt = (input_hidden_states_contrl * step + encoder_hidden_states * (args.max_train_steps - step)) / args.max_train_steps
                 #with torch.no_grad():
                 hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
-                control_addition = controlnet(noisy_latents, timesteps, encoder_hidden_states, hed).mid_block_res_sample
+                control_addition_down, control_addition_mid = controlnet(noisy_latents, timesteps, encoder_hidden_states, controlnet_cond=hed, return_dict=False)#.mid_block_res_sample
+                # if use down_block for ddp training, modify the += inplace operation of controlnet downblock addition
+                control_addition_down_inp = []
+                ll = len(control_addition_down)
+                for num, item in enumerate(control_addition_down):
+                    control_addition_down_inp += item * (1 - num / ll) * rnd * 0.3
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, \
-                                    mid_block_additional_residual=control_addition * rnd).sample
+                                    mid_block_additional_residual=control_addition_mid * rnd, down_block_additional_residuals=[item * rnd for item in control_addition_down]).sample
 
                 #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 

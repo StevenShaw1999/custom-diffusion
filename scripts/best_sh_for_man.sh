@@ -1,9 +1,9 @@
 export MODEL_NAME="runwayml/stable-diffusion-v1-5"
-accelerate launch --gpu_ids 1,2 --main_process_port 9998 src/finetune_lora_control_first_textural.py \
+accelerate launch --gpu_ids 0,1 --main_process_port 9998 src/finetune_lora_control.py \
           --pretrained_model_name_or_path=$MODEL_NAME  \
           --instance_data_dir=./data/fame  \
           --class_data_dir=./gen_reg/samples_man/samples/ \
-          --output_dir=./logs/man_lora_textural_noreg_full_control_220  \
+          --output_dir=./logs/man_lora_textural_noreg_control_uncond_220_timedecay  \
           --with_prior_preservation --prior_loss_weight=0.0 \
           --class_prompt="a man" \
           --resolution=512  \
