@@ -10,7 +10,7 @@ sys.path.append('./')
 import torch
 from diffusers import StableDiffusionPipeline, UNet2DConditionModel
 from src import diffuser_training 
-from diffusers import UniPCMultistepScheduler, DPMSolverMultistepScheduler
+from diffusers import UniPCMultistepScheduler, DPMSolverMultistepScheduler, DiffusionPipeline
 
 #from lora_diffusion import monkeypatch_or_replace_lora, tune_lora_scale
 
@@ -18,6 +18,15 @@ from diffusers import UniPCMultistepScheduler, DPMSolverMultistepScheduler
 def sample(ckpt, delta_ckpt, from_file, prompt, compress, freeze_model):
     model_id = ckpt
     pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16).to("cuda")
+
+    pipe = DiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16,
+        safety_checker=None,  # Very important for videos...lots of false positives while interpolating
+        custom_pipeline="/data1/jiayu_xiao/project/custom-diffusion/custom_pipelines_interpolation/pipelines.py",
+    ).to('cuda')
+    pipe.enable_attention_slicing()
+
     pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
     
     outdir = 'outputs/txt2img-samples'
@@ -29,14 +38,29 @@ def sample(ckpt, delta_ckpt, from_file, prompt, compress, freeze_model):
         outdir = os.path.dirname(delta_ckpt)
     
     pipe.unet.load_attn_procs(outdir)
+
+    frame_filepaths = pipe.walk(
+        prompts=['a man is playing with a cat, highly detailed, best quality', 'a <new1> man is playing with a cat, highly detailed, best quality'],
+        seeds=[0, 0],
+        num_interpolation_steps=16,
+        output_dir='/data1/jiayu_xiao/project/custom-diffusion/dreams',
+        batch_size=4,
+        height=512,
+        width=512,
+        guidance_scale=6,
+        #negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * 3,
+        num_inference_steps=20,
+    )
+    exit()
+
     if prompt is not None:
         image_list = []
         for i in range(1, 4):
             generator = [torch.Generator(device="cpu").manual_seed(j * i) for j in [5,6,7]]
-            images = pipe.inference([prompt]*3, num_inference_steps=20, guidance_scale=6., 
+            images = pipe([prompt]*3, num_inference_steps=20, guidance_scale=6., 
                           negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * 3,
                           eta=1., generator=generator,
-                         cross_attention_kwargs={"scale": 1.0}, personalize_prompt=5).images
+                         cross_attention_kwargs={"scale": 1.0}).images
             #images = pipe([prompt]*5, num_inference_steps=200, guidance_scale=6., eta=1.).images
             images = np.hstack([np.array(x) for x in images])
             image_list.append(images)

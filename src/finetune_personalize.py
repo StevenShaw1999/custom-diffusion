@@ -622,7 +622,7 @@ def parse_args(input_args=None):
         help="A token to use as a modifier for the concept.",
     )
     parser.add_argument(
-        "--initializer_token", type=str, default='ktn+pll+ucd', help="A token to use as initializer word."
+        "--initializer_token", type=str, default='ktn+pll+ucd+Øº+Øµ', help="A token to use as initializer word."
     )
     parser.add_argument("--hflip", action="store_true", help="Apply horizontal flip data augmentation.")
 
@@ -1118,7 +1118,7 @@ def main(args):
         # Initialise the newly added placeholder token with the embeddings of the initializer token
         token_embeds = text_encoder.get_input_embeddings().weight.data
 
-        for (x,y) in zip(modifier_token_id,initializer_token_id):        
+        for (x,y) in zip(modifier_token_id,initializer_token_id):           
             token_embeds[x] = token_embeds[y]
         # Freeze all parameters except for the token embeddings in text encoder
         params_to_freeze = itertools.chain(
@@ -1126,13 +1126,14 @@ def main(args):
             text_encoder.text_model.final_layer_norm.parameters(),
             text_encoder.text_model.embeddings.position_embedding.parameters(),
         )
+
         freeze_params(params_to_freeze)
         #params_to_optimize = itertools.chain( text_encoder.get_input_embeddings().parameters())
         #hh = list(text_encoder.get_input_embeddings().parameters())
         
         params_to_optimize = itertools.chain([
             {"params": itertools.chain(lora_layers.parameters()), "lr": args.learning_rate},
-            {"params": itertools.chain(text_encoder.get_input_embeddings().parameters()), "lr": 3e-4},
+            {"params": itertools.chain(text_encoder.get_input_embeddings().parameters()), "lr": 5e-3},
         ])
         
         #params_to_optimize = itertools.chain(text_encoder.get_input_embeddings().parameters() , [x[1] for x in unet.named_parameters() if ('attn2.to_k' in x[0] or 'attn2.to_v' in x[0])] )
@@ -1310,8 +1311,11 @@ def main(args):
 
                 # Get the text embedding for conditioning
                 new_batch_prompts = batch["input_ids"]
-
-
+                new_add = torch.range(1, 5).long().to(latents.device)
+                #for i in range(1, 6):
+                new_batch_prompts[0][-5:] += new_add
+                #print(new_batch_prompts)
+                #exit()
                 #prior_prompts = batch["input_ids"][-1].unsqueeze(0).repeat(4, 1)
 
                 
@@ -1334,6 +1338,7 @@ def main(args):
 
                 
                 encoder_hidden_states = text_encoder(new_batch_prompts)[0]
+                
                 input_hidden_states_contrl = encoder_hidden_states[1].unsqueeze(0).repeat(encoder_hidden_states.shape[0], 1, 1)
 
 
@@ -1382,7 +1387,7 @@ def main(args):
                 exit()"""
                 #with torch.no_grad():
                 if reverse_flag:
-                    rnd[0] = 0.0
+                    """rnd[0] = 0.0
                     hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
                     control_addition_down, control_addition_mid = controlnet(noisy_latents, timesteps, encoder_hidden_states, controlnet_cond=hed, return_dict=False)#.mid_block_res_sample
                     # if use down_block for ddp training, modify the += inplace operation of controlnet downblock addition
@@ -1392,7 +1397,7 @@ def main(args):
                         if item.shape[3] <= 8:
                             control_addition_down_inp.append(item * rnd) 
                         else:
-                            control_addition_down_inp.append(item * 0)
+                            control_addition_down_inp.append(item * 0)"""
                     
                     #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, \
                     #                    mid_block_additional_residual=control_addition_mid * rnd, \
@@ -1401,7 +1406,7 @@ def main(args):
                     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
                 
                 else:
-                    rnd[0] = 0.0
+                    """rnd[0] = 0.0
                     hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
                     control_addition_down, control_addition_mid = controlnet(noisy_latents, timesteps, encoder_hidden_states, controlnet_cond=hed, return_dict=False)#.mid_block_res_sample
                     # if use down_block for ddp training, modify the += inplace operation of controlnet downblock addition
@@ -1411,7 +1416,7 @@ def main(args):
                         if item.shape[3] <= 8:
                             control_addition_down_inp.append(item * rnd) 
                         else:
-                            control_addition_down_inp.append(item * 0)
+                            control_addition_down_inp.append(item * 0)"""
                     
                     #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, \
                     #                    mid_block_additional_residual=control_addition_mid * rnd, \
@@ -1462,9 +1467,9 @@ def main(args):
                     instance_mask_soft = instance_mask #+ (1 - instance_mask) * 0.25
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none") #* out_mask[:2]# * timesteps_exp[:2]
                     #if reverse_flag:
-                    loss = ((loss*instance_mask_soft).sum([1, 2, 3])/instance_mask_soft.sum([1, 2, 3])).mean()
+                    #loss = ((loss*instance_mask_soft).sum([1, 2, 3])/instance_mask_soft.sum([1, 2, 3])).mean()
                     #else:
-                    #    loss = ((loss*mask).sum([1, 2, 3])/mask.sum([1, 2, 3])).mean() #/ out_mask[:2].mean()
+                    loss = ((loss*mask).sum([1, 2, 3])/mask.sum([1, 2, 3])).mean() #/ out_mask[:2].mean()
                     #loss = 0
                     """for b in range(len(model_pred)):
                         arr = torch.tensor([0, 1, 2, 3]).to(latents.device)
@@ -1479,13 +1484,13 @@ def main(args):
                         loss += loss_func(model_pred[b, arr, :, :].reshape(3, -1).permute(1,0), target[b, arr, :, :].reshape(3, -1).permute(1,0))/ (b+1) * 20"""
 
                     # Compute prior loss
-                    prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                    #prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
                     #prior_loss = (prior_loss * ).mean() / out_mask_prior.mean()
                     #prior_loss = F.mse_loss(model_pred_prior.float() * out_mask_prior, target_prior.float() * out_mask_prior, reduction="mean") / out_mask_prior.mean()
 
                     #prior_loss = 0
                     # Add the prior loss to the instance loss.
-                    loss = loss + args.prior_loss_weight * prior_loss
+                    #loss = loss + args.prior_loss_weight * prior_loss
                 else:
                     mask = batch["mask"]
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
@@ -1556,7 +1561,7 @@ def main(args):
 
 
             if global_step >= args.max_train_steps:
-                args.max_train_steps = 40
+                args.max_train_steps = 2
                 if not reverse_flag:
                     global_step = 1
                     reverse_flag = True

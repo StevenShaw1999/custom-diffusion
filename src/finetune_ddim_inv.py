@@ -739,7 +739,7 @@ class CustomDiffusionDataset(Dataset):
         
         if self.image_mask_pth is not None:
             #transformed = self.flip_with_mask(image=np.array(instance_image), mask=np.array(instance_mask))
-            if torch.rand(1) > 0.5:
+            if torch.rand(1) > 5:
                 instance_image = self.flip_mask(instance_image)
                 instance_mask = self.flip_mask(instance_mask)
         else:
@@ -754,7 +754,7 @@ class CustomDiffusionDataset(Dataset):
         if random_scale % 2 == 1:
             random_scale += 1
 
-        #random_scale = self.size
+        random_scale = self.size
 
         if random_scale < 0.6*self.size:
             add_to_caption = np.random.choice(["a far away ", "very small "])
@@ -1264,6 +1264,8 @@ def main(args):
 
     #loss_func = SamplesLoss(loss="sinkhorn", p=2, blur=.05)
     #ones_mask = torch.ones(4, 1, 64, 64).to(accelerator.device)
+    x_t = torch.load('/data1/jiayu_xiao/project/pix2pix-zero/output/test_fame/inversion/yann-lecun_list.pt').to(accelerator.device)
+
     Upsample = torch.nn.Upsample(64, mode='bilinear')
     reverse_flag = False
     for epoch in range(args.num_train_epochs * 2):
@@ -1300,13 +1302,19 @@ def main(args):
                 timesteps[0] = sudo_timesteps
                 #print(timesteps)
                 
+                time_cpy = timesteps.clone()
+                
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
 
+                #noise[0] = noise[0] * 0.8 + x_t * 0.2
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
+                time_cpy[1] = timesteps[0] // 100 * 100
 
+                if not reverse_flag:
+                    noisy_latents[0] = noise_scheduler.add_noise_inter(latents[0], x_t[timesteps[0] // 100 - 1], noise[0], time_cpy)
 
                 # Get the text embedding for conditioning
                 new_batch_prompts = batch["input_ids"]
@@ -1382,7 +1390,7 @@ def main(args):
                 exit()"""
                 #with torch.no_grad():
                 if reverse_flag:
-                    rnd[0] = 0.0
+                    """rnd[0] = 0.0
                     hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
                     control_addition_down, control_addition_mid = controlnet(noisy_latents, timesteps, encoder_hidden_states, controlnet_cond=hed, return_dict=False)#.mid_block_res_sample
                     # if use down_block for ddp training, modify the += inplace operation of controlnet downblock addition
@@ -1392,7 +1400,7 @@ def main(args):
                         if item.shape[3] <= 8:
                             control_addition_down_inp.append(item * rnd) 
                         else:
-                            control_addition_down_inp.append(item * 0)
+                            control_addition_down_inp.append(item * 0)"""
                     
                     #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, \
                     #                    mid_block_additional_residual=control_addition_mid * rnd, \
@@ -1401,7 +1409,7 @@ def main(args):
                     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
                 
                 else:
-                    rnd[0] = 0.0
+                    """rnd[0] = 0.0
                     hed = apply_hed(batch["pixel_values"]).repeat(1, 3, 1, 1)
                     control_addition_down, control_addition_mid = controlnet(noisy_latents, timesteps, encoder_hidden_states, controlnet_cond=hed, return_dict=False)#.mid_block_res_sample
                     # if use down_block for ddp training, modify the += inplace operation of controlnet downblock addition
@@ -1411,7 +1419,7 @@ def main(args):
                         if item.shape[3] <= 8:
                             control_addition_down_inp.append(item * rnd) 
                         else:
-                            control_addition_down_inp.append(item * 0)
+                            control_addition_down_inp.append(item * 0)"""
                     
                     #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, \
                     #                    mid_block_additional_residual=control_addition_mid * rnd, \
@@ -1444,7 +1452,7 @@ def main(args):
                 #model_pred = unet(latents[3].unsqueeze(0), 0, encoder_hidden_states[3].unsqueeze(0)).sample
                 #hh = controller.get_average_attention()
                 
-
+                pred_noisy = noise_scheduler.add_noise(latents, model_pred, timesteps)
                 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1457,11 +1465,16 @@ def main(args):
                     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
+                    pred_noisy, _ = torch.chunk(pred_noisy, 2, dim=0)
+                    noisy_latents, _ = torch.chunk(noisy_latents, 2, dim=0)
                     mask = torch.chunk(batch["mask"], 2, dim=0)[0]
                     # Compute instance loss
                     instance_mask_soft = instance_mask #+ (1 - instance_mask) * 0.25
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none") #* out_mask[:2]# * timesteps_exp[:2]
+                    if reverse_flag:
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="none") #* out_mask[:2]# * timesteps_exp[:2]
                     #if reverse_flag:
+                    else:
+                        loss = F.mse_loss(pred_noisy.float(), noisy_latents.float(), reduction="none")
                     loss = ((loss*instance_mask_soft).sum([1, 2, 3])/instance_mask_soft.sum([1, 2, 3])).mean()
                     #else:
                     #    loss = ((loss*mask).sum([1, 2, 3])/mask.sum([1, 2, 3])).mean() #/ out_mask[:2].mean()
